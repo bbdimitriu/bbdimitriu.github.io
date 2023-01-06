@@ -55,13 +55,26 @@ Intermezzo: I mention things that "compose well" and "functional composition". W
 ### Dependency injection
 Most JVM developers would be familiar with the concept of "dependency injection" which was made popular by the Spring framework. The main idea is that when you assemble the application (at the top level), you loosely couple its components, so that you can easily swap different implementations for various situations. This is also called "_inversion of control_".
 
-ZIO also provides its own ability to wire together an application, but it does so "natively", using the `ZLayer[-RIn, +E, +ROut]`, which has many similarities to `ZIO[R, E, A]`.
+ZIO also provides its own ability to wire together an application, but it does so "natively", using `ZLayer[-RIn, +E, +ROut]`, which has many similarities to `ZIO[R, E, A]`.
 
 I must admit that in the beginning I wasn't quite sure about using this feature in my application, primarily because I didn't feel the need to use an IoC framework for a very long time. However, with most of the libraries in the ZIO ecosystem there is no getting away from understanding and using `ZLayers` (and `ZEnvironment`). And fairly quickly I actually got to like it. I think that the feature that contributed mostly to that was [Automatic layer construction](https://zio.dev/reference/di/automatic-layer-construction/). In terms of what it achieves it is similar to the [Spring Autowired](https://docs.spring.io/spring-framework/docs/current/javadoc-api/org/springframework/beans/factory/annotation/Autowired.html) annotation, but I find the ZIO approach more elegant because the developer experience is better - there is no metaprogramming involved and everything is statically type-checked. You even get really nice compiler messages when you forget to provide some required layers.
 
 Manual compositions seems to be nice as well, although I haven't used it much so far.
 
 It takes a bit of getting used to, especially understanding sometimes unexpected environment requirements, but the compiler always points you into the right direction, because these layers always compose in a functionally correct way.
+
+As you may expect, the ZIO runtime also manages the lifecycle of the layers, creating and destroying them (if required) automatically in the appropriate order. `ZLayer.scoped` wrapping `ZIO.acquireRelease` is very useful in these situations, as in the example below, in which a [Testcontainers](https://www.testcontainers.org/) [Localstack](https://www.testcontainers.org/modules/localstack/) container is wrapped in a ZLayer and it is started and stopped by ZIO automatically:
+```scala
+private val localStackContainerLayer: ZLayer[Any, Nothing, LocalStackV2Container] =
+  ZLayer.scoped {
+    ZIO.acquireRelease(ZIO.succeed {
+      val localStackContainer = LocalStackV2Container(services = Seq(Service.S3, Service.KINESIS, Service.DYNAMODB, Service.CLOUDWATCH), tag = "1.3.0")
+      localStackContainer.start()
+      localStackContainer
+    })(container => ZIO.succeed(container.stop()))
+  }
+```
+In fact `ZIO.acquireRelease` and the other [resource management]((https://zio.dev/reference/resource/scope)) features are themselves very powerful constructs. 
 
 Here are some "gotchas" that tripped me for a while until I understood how things should work:
 
@@ -100,7 +113,49 @@ override def spec = suite("Stub Ripper Spec")(
 ```
 The same works with plain ZIO effects rather than ZIO test specs.
 
+#### Providing the environment to an effect somewhere in the program
+When using the STTP HTTP client with the ZIO backend I had a situation where I had to provide the environment for a ZStream[S3, Nothing, Byte] to make it a ZStream[Any, Nothing, Byte], because that's what the STTP API works with. And I couldn't use `ZIO#provideLayer(s3Layer)`, because I didn't have a reference to the `s3Layer` in that part of the code.
 
+It took me a while to figure out how to achieve that, but in the end the solution is relatively simple: I had to use `ZIO.environment[S3]`
+See the example below, which I tried to reduce to the essence of the problem as much as possible:
+```scala
+import sttp.capabilities.WebSockets
+import sttp.capabilities.zio.ZioStreams
+import sttp.client3.{Response, SttpBackend, basicRequest}
+import sttp.model.Uri
+import zio.*
+import zio.s3.S3
+import zio.stream.ZStream
+
+object SttpPostExample extends ZIOAppDefault {
+
+  private def program = {
+    val streamWithoutS3Environment: ZStream[S3, Nothing, Byte] = ??? // <- we construct a ZStream that requires an `S3` layer
+
+    for {
+      s3Environment <- ZIO.environment[S3] // extract an environment with the requirements of the stream
+      streamWithCompleteEnvironment: ZStream[Any, Nothing, Byte] = streamWithoutS3Environment.provideEnvironment(s3Environment) // <- provide all the environment requirements to the ZStream
+      response <- Uploader.upload(uri = ???, streamWithCompleteEnvironment)
+    } yield response
+  }
+
+  override def run = {
+    val s3Layer: ZLayer[Any, Nothing, S3] = ???
+    val sttpLayer: ZLayer[Any, Nothing, SttpBackend[Task, ZioStreams & WebSockets]] = ???
+
+    program.provide(s3Layer, sttpLayer)
+  }
+}
+
+object Uploader {
+
+  def upload(uri: Uri, content: ZStream[Any, Nothing, Byte]): ZIO[SttpBackend[Task, ZioStreams], Throwable, Response[Either[String, String]]] =
+    for {
+      backend <- ZIO.service[SttpBackend[Task, ZioStreams]]
+      response <- backend.send(basicRequest.post(uri).streamBody(ZioStreams)(content)) // !!! The STTP API requires a ZStream[Any, Nothing, Byte]
+    } yield response
+}
+```
 
 Talk about:
 * error handling: before (Try), after (ZIO[R, E, A])
@@ -110,7 +165,7 @@ Talk about:
 * dependency injection
   * orderly shutdown
 * streaming
-* debugging - ".debug"; sometimes stacktraces don't make sense, but this seems to improve with newer ZIO releases (e.g. 2.0.2 vs. 2.0.5)
+* debugging - ".debug"; sometimes stacktraces don't make sense (see https://github.com/svroonland/zio-kinesis/issues/797), but this seems to improve with newer ZIO releases (e.g. 2.0.2 vs. 2.0.5)
 * testing
 * pitfalls
   * all effects have to compose eventually into a single effect, runnable from `run`
