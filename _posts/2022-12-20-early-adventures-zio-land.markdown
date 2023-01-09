@@ -3,9 +3,8 @@ layout: post
 title:  "Early adventures into ZIO land"
 date:   2022-12-20 01:01:53 +0000
 categories: scala zio
+toc: true
 ---
-# Early adventures into ZIO land
-
 I've been writing Scala applications for more than a decade now, but I wouldn't call myself anywhere close to an expert in it.
 I really do enjoy coding in Scala whenever I have a chance, although this doesn't happen very often these days, given that I spend a lot of time in the world of cloud infrastructure and architecture (more on that some other time, hopefully).
 
@@ -114,7 +113,7 @@ override def spec = suite("Stub Ripper Spec")(
 The same works with plain ZIO effects rather than ZIO test specs.
 
 #### Providing the environment to an effect somewhere in the program
-When using the STTP HTTP client with the ZIO backend I had a situation where I had to provide the environment for a ZStream[S3, Nothing, Byte] to make it a ZStream[Any, Nothing, Byte], because that's what the STTP API works with. And I couldn't use `ZIO#provideLayer(s3Layer)`, because I didn't have a reference to the `s3Layer` in that part of the code.
+When using the STTP HTTP client with the ZIO backend I had a situation where I had to provide the environment for a ZStream[S3, Nothing, Byte] to make it a ZStream[Any, Nothing, Byte], because that's what the STTP API works with. I suppose this is a deficiency of STTP, because it should allow the use of a generic environment `R` for the ZStream to be POST-ed, but it's the way the API is at the moment. And I couldn't use `ZIO#provideLayer(s3Layer)`, because I didn't have a reference to the `s3Layer` in that part of the code.
 
 It took me a while to figure out how to achieve that, but in the end the solution is relatively simple: I had to use `ZIO.environment[S3]`
 See the example below, which I tried to reduce to the essence of the problem as much as possible:
@@ -157,28 +156,93 @@ object Uploader {
 }
 ```
 
+### Streaming with `ZStream`
+For streaming, I had two requirements in my program, described below. ZStream has very similar APIs to the ZIO type, so most of the compositional constructs come naturally.
+#### Streaming data from an AWS Kinesis stream
+For this purpose I used the [zio-kinesis](https://github.com/svroonland/zio-kinesis) library because it has an API built on top of [zio-streams](https://zio.dev/reference/stream/) and it offers the same high-level consumer features as the official [KCL library](https://docs.aws.amazon.com/streams/latest/dev/kcl2-standard-consumer-java-example.html). The library is of a good quality from what I can see so far, so I didn't have any issues in getting it to work as I needed. The shards are processed in parallel between them, but by default the data within a shard is processed sequentially. However, because I didn't care about the processing order even for elements within the same shard, I could easily parallelise the processing of each individual record, as in the following code:
+```scala
+def getKinesisStream[R, E, T](recordHandler: Record[String] => ZIO[R, E, T]) =
+  Consumer
+    .shardedStream(
+      streamName = "my_stream",
+      applicationName = "my_application",
+      deserializer = Serde.asciiString,
+      workerIdentifier = "my_worker_identifier", // make sure you use a unique name for each worker
+      initialPosition = Consumer.InitialPosition.Latest
+    )
+    // we always want to process each shard in parallel, that's why we use a "safe" value of `Int.MaxValue` in `flatMapPar`
+    .flatMapPar(Int.MaxValue) { case (_, shardStream, checkpointer) =>
+      shardStream
+        // processing the elements from the same shard in parallel too, because we don't care about the order
+        // the level of parallelism here affects how many concurrent requests Cape server will receive
+        // the maximum number of parallel requests will be `numberOfShards * myStreamProcessingParallelism`
+        .mapZIOParUnordered(myStreamProcessingParallelism)(record =>
+          recordHandler(record)
+            .ignore // here we don't care here if the element scanning succeeded or failed, we just don't want to fail the stream
+            .as(record)) // transforming the stream back to a stream of Records so that we can checkpoint it
+        .tap(tuple => checkpointer.stage(tuple))
+        .viaFunction(
+          checkpointer.checkpointBatched[R](nr = kinesisConfig.checkpointBatchSize, interval = kinesisConfig.checkpointDuration)
+        )
+    }
+```
+The only thing that was a bit trickier here was deciding how to test the above, code. The type of stream above is `ZStream[Any, Throwable, Unit]`, because of the checkpointer transformation at the end. This means that I cannot just put some records into the Kinesis stream and use the stream above to read them on the other side of the pipe. But there is at least one easy solution: make the `recordHandler` function add at the end the element that it processes to a [ZIO Queue](https://zio.dev/reference/concurrency/queue) and then the elements can be de-queued in the test to do te assertions. 
+#### Streaming a file from an AWS S3 location and sending it over to an HTTP server using a POST request
+I had no problems in this area. I have used the [zio-s3](https://github.com/zio/zio-s3) library to obtain a ZStream reference to an S3 object and then I passed that reference to an [STTP client with a ZIO backend](https://sttp.softwaremill.com/en/latest/backends/zio.html) when I needed to make the POST request. It seems to well, it is non-blocking and the API is very simple:
+```scala
+val objectLocation = ??? // the URI of the S3 object
+val myObjectStream: ZStream[Any, Throwable, Byte] = 
+  ZStream.fromZIO(ZIO.attempt(new URI(objectLocation))).flatMap(uri => getObject(uri.getHost, uri.getPath.substring(1)))
+  
+for {
+  backend <- ZIO.service[SttpBackend[Task, ZioStreams]] // the backend is provided from the environment
+  response <- backend.send(
+    basicRequest.post(capeUri)
+      .streamBody(ZioStreams)(myObjectStream)
+      .readTimeout(scala.concurrent.duration.Duration(capeConfig.capeReadTimeoutMs.toLong, TimeUnit.MILLISECONDS))
+      .headers(Map(
+        "Header1" -> "value1",
+        "Header2" -> "value2"
+      ))
+  )
+} yield response
+```
+
+### Testing
+For the most part, the zio-testing is very straightforward to use, but this is one area where I had some issues for a while, not because the ZIO testing framework if buggy, but because I misunderstood the documentation and because it was a bit difficult to find examples that matched my requirements.
+
+First, I found it a bit odd how the tests in a suite are structured, all in a single call to the `suite` method, but I got used to it and it didn't make things more difficult.
+```scala
+override def spec = suite("My suite")(
+  test("Test 1") {
+    for {
+      o1 <- effect1
+      o2 <- effect2
+    } yield assertTrue(o1 == o2)
+  }.provideSomeLayer(myLayer)
+    @@ TestAspect.before(someSetupToRunBeforeTest())
+    @@ TestAspect.timeout(20.seconds))
+```
+The main thing that caused me some headaches is the fact that by default in ZIO tests "Calls to sleep and methods derived from it will semantically block until the clock time is set/adjusted to on or after the time the effect is scheduled to run". This is actually documented clearly [here](https://zio.dev/reference/test/services/clock), but in my test I didn't really need this behaviour and I wanted the time to pass as in real life. So it took me some time to figure out why my test, which uses some zio-streams test utility classes that call `ZIO.sleep`, got stuck.
+
+Changing this behaviour to the one I expected was pretty simple: I had to add the `@@ TestAspect.withLiveClock` aspect to the respective test. It would have helped if this behaviour was more clearly stated somewhere at the beginning of the testing reference documentation.
+
+Otherwise, in general, I consider the design of the testing framework quite neat and pleasant to use.
+
+### Debugging
+Debugging can be done in various ways. One of the most common ways is to add various logging statements
+
+
 Talk about:
-* error handling: before (Try), after (ZIO[R, E, A])
-* the ZIO course (Daniel Ciocarlan)
-* functional composition 
-* resource management (`ZIO.acquireWith()`)
-* dependency injection
-  * orderly shutdown
-* streaming
 * debugging - ".debug"; sometimes stacktraces don't make sense (see https://github.com/svroonland/zio-kinesis/issues/797), but this seems to improve with newer ZIO releases (e.g. 2.0.2 vs. 2.0.5)
-* testing
-* pitfalls
-  * all effects have to compose eventually into a single effect, runnable from `run`
-  * passing the Environment to a ZIO/ZStream parameter in a method call - ZEnvironment - is this the right solution?
-  * time in tests - not particularly obvious what the default behaviour is. The `@@ TestAspect.withLiveClock` annotation
   * meaningful stack traces (for the most part)
+
 * ecosystem
   * zio-aws; special mention for zio-kinesis; mention the issue with kinesis-stream & zio-http
   * sttp support for zio
   * a diverse ecosystem (https://zio.dev/ecosystem/) seems to have appeared out of nowhere - I have a feeling it's because of the strong foundations. Admittedly, some integrations listed there seem very raw/basic.
   * Application performance measuring and instrumentation: ZIO + Opentracing + DataDog
 * IntelliJ support: the ZIO plugin seems to suggest good refactoring + it allows testing integration - I had a very quick reply from one of the project maintainers when the early access release for ZIO 2 bumped into an error
-* For me ZIO has been quite a revelation and it seems to be like the next big thing in the same way that Spring was for the Java world
 * Caveats:
   * I haven't run it in production yet (to come soon in the new year)
   * I haven't done any profiling yet. I will need to figure out how to do it with the DataDog APM
