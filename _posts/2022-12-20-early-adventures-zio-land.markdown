@@ -24,14 +24,14 @@ These pipes can [fail in expected ways](https://zio.dev/reference/error-manageme
 The pipes (effects) can also optionally have specific features that they require in order to function, so they must be provided by the program. These constitute the effect's environment (the type **R**). You can think of these as smart electronic chips that are required by the individual pipe to actually do what it is supposed to.
 This pipe architecture doesn't do anything until data starts flowing through it. That is until we "run" it with the "effects engine".
 
-So there you have it. In a nutshell this is what a `ZIO[R, E, A]` is about. Of course, I'm over-simplifying things, there is a lot more depth packed into this apparently basic construct.
+In a nutshell this is what a `ZIO[R, E, A]` is about. Of course, I'm over-simplifying things, there is a lot more depth packed into this apparently basic construct.
 
 But this blog is not meant to be a ZIO tutorial, so let's talk about some practical experience with it :)
 
 ### The application
 
 Fairly recently I got to work on a relatively simple component, that was meant to handle a message processing pipeline that I could sum up this way:
-_Consume a JSON message from AWS Kinesis ~~> Parse the JSON and extract an S3 location ~~> Fetch the S3 object from that location ~~> POST the object to an HTTP server and read the result_
+_Consume a JSON message from AWS Kinesis ~~> Parse the JSON and extract an S3 location ~~> Fetch the S3 object from that location ~~> POST the object to an HTTP server and read the result_.
 Nothing fancy here.
 
 The component does need to handle a fairly high and sustained rate of processed messages per second (in the thousands).
@@ -230,19 +230,112 @@ Changing this behaviour to the one I expected was pretty simple: I had to add th
 Otherwise, in general, I consider the design of the testing framework quite neat and pleasant to use.
 
 ### Debugging
-Debugging can be done in various ways. One of the most common ways is to add various logging statements
+Debugging can be done in various ways. Most of the practices described in the ZIO guide: https://zio.dev/guides/tutorials/debug-a-zio-application/.
 
+In general, I also found exception stack traces to be useful, although I have bumped into a situation in which I couldn't understand much out of an exception (see [this](https://github.com/svroonland/zio-kinesis/issues/797)).
+I have also noticed the rendering of the exception stacktrace getting better in between releases.
 
-Talk about:
-* debugging - ".debug"; sometimes stacktraces don't make sense (see https://github.com/svroonland/zio-kinesis/issues/797), but this seems to improve with newer ZIO releases (e.g. 2.0.2 vs. 2.0.5)
-  * meaningful stack traces (for the most part)
+One important thing that I'm still missing at the moment, which I found really useful with the synchronous/blocking JVM applications, is the ability to easily request a Fiber dump.
+I've been many times into a situation where the application gets stuck and I have no idea why, especially if it's some code from some third party library.
+With blocking applications one can request a thread dump with `kill -3 <PID>` or `jstack <PID>` and can find out where the blockage is.
+With non-blocking applications this approach is mostly useless, of course.
 
-* ecosystem
-  * zio-aws; special mention for zio-kinesis; mention the issue with kinesis-stream & zio-http
-  * sttp support for zio
-  * a diverse ecosystem (https://zio.dev/ecosystem/) seems to have appeared out of nowhere - I have a feeling it's because of the strong foundations. Admittedly, some integrations listed there seem very raw/basic.
-  * Application performance measuring and instrumentation: ZIO + Opentracing + DataDog
-* IntelliJ support: the ZIO plugin seems to suggest good refactoring + it allows testing integration - I had a very quick reply from one of the project maintainers when the early access release for ZIO 2 bumped into an error
-* Caveats:
-  * I haven't run it in production yet (to come soon in the new year)
-  * I haven't done any profiling yet. I will need to figure out how to do it with the DataDog APM
+ZIO does have the ability to request a dump of all fibers using [Fiber.dumpAll](https://zio.dev/api/zio/fiber$#dumpAll(implicittrace:zio.Trace):zio.ZIO[Any,java.io.IOException,Unit]), but I couldn't find a way to trigger it externally from the application.
+There is [this ticket](https://github.com/zio/zio/issues/2263), which has been open for a while, but it looks like it got de-prioritised.
+So, unless I'm missing some better approach to achieve this, I think that this is something really important to be addressed by the ZIO devs.
+Perhaps with the advent of [Project Loom](https://openjdk.org/projects/loom/) this issue will be neatly solved, given how well positioned the ZIO 2 engine is to take advantage of the new Virtual Threads, but I wish there was an easier way available now.
+
+### Logging
+
+The usual libraries I reach out for when I need to do logging in my Scala application are `logback`, `slf4j` and occasionally `scala-logging`.
+With ZIO you will want to do effectful logging, therefore you need to use [zio-logging](https://zio.dev/zio-logging/).
+
+In my case I needed the application to log in JSON format to `stdout` (because we run it in ephemeral Kubernetes pods and logs are collected with FluentBit)
+Initially, probably due to inertia, I rushed to configure Logback + SLF4J with `logstash-logback-encoder` (for the JSON format).
+However, due to an issue I encountered (and which I didn't manage to get to the bottom of), I realised that I don't in fact need any of this.
+ZIO Logging can do JSON format to stdout just as well:
+```scala
+import zio.logging.*
+
+object MainZIO extends ZIOAppDefault {
+  
+  override val bootstrap: ZLayer[ZIOAppArgs, Any, Any] = Runtime.removeDefaultLoggers >>> consoleJson(LogFormat.default)
+
+  override def run = ZIO.logError("Some error")
+}
+```
+Also, the nice thing about using this approach is that now in the logs under the `thread` attribute I can actually see the Fiber ID (e.g. `"thread":"zio-fiber-36"`) instead of the Thread name where the fiber actually runs.
+This is quite nice because you get more information about how things run in parallel or sequentially. 
+
+### Profiling
+In my team, we use the DataDog APM for instrumenting, tracing and profiling applications our applications.
+So I wanted to use the same thing for my new ZIO application. Fortunately, things seemed to work quite seamlessly here, with the help of the [zio-telemetry OpenTracing](https://zio.dev/zio-telemetry/opentracing) library.
+DataDog APM [supports OpenTracing](https://docs.datadoghq.com/tracing/trace_collection/custom_instrumentation/java/) for custom instrumentation, for the cases where it doesn't automatically support some libraries, like STTP.
+
+Here's what I needed to do to get custom defined spans:
+* Added the following dependencies to `build.sbt`: 
+```
+"dev.zio" %% "zio-opentracing" % "3.0.0-RC1",
+"io.opentracing" % "opentracing-util" % "0.33.0"
+```
+* The code goes roughly like this:
+```scala
+import io.opentracing.Tracer
+import io.opentracing.util.GlobalTracer
+import zio.telemetry.opentracing.OpenTracing
+
+val defaultTracerLayer: ULayer[Tracer] = ZLayer.fromZIO(ZIO.succeed(GlobalTracer.get))
+val program: ZIO[Any, Nothing, Any] = ???
+
+override def run: URIO[Any, ExitCode] =
+  program.provide(
+    OpenTracing.live(),
+    defaultTracerLayer
+  )
+
+def program: ZIO[OpenTracing, Nothing, Any] =
+  ZIO.serviceWithZIO[OpenTracing] { tracing =>
+    import tracing.aspects.*
+    (for {
+      httpResponse <- makeSomeHttpRequest @@ span("my_http_request")
+      responseCode = httpResponse.code
+      customerId = httpResponse.customerId
+      _ <- saveToDb(customerId) @@ span("cape_scan") @@ tag("customer_id", customerId) @@ tag("mail_id", emailId)
+    } yield response) @@ root("process_customer_request")
+  }
+
+```
+The `import tracing.aspects.*` seems a bit unusual there, but it's not a big deal. Perhaps the API can be improved a bit in this area. 
+
+### The ZIO ecosystem
+
+I must say that I am totally impressed with the [sprawling ZIO ecosystem](https://zio.dev/ecosystem/) given how young the framework itself is.
+For my use case I found a library for pretty much all aspects of my application.
+
+Aside from [zio-kinesis](https://github.com/svroonland/zio-kinesis), [sttp](https://sttp.softwaremill.com/) and [zio-s3](https://zio.dev/zio-s3/), which I have mentioned above, I'd also bring up:
+* [zio-aws](https://zio.dev/zio-aws/), which is a must-have if you need to interact with AWS services
+* [zio-json](https://zio.dev/zio-json/) is also very easy to use if you work with JSON (and who doesn't these days? :) )
+* the [ZIO Intellij plugin](https://plugins.jetbrains.com/plugin/13820-zio-for-intellij) can be quite helpful and it is a must if you are going to run tests from within the IDE
+
+I must also mention the fact that before I found [sttp](https://sttp.softwaremill.com/), I actually tried to use [zio-http](https://zio.dev/ecosystem/community/zio-http), but due to [this issue](https://github.com/svroonland/zio-kinesis/issues/797) I was not able to get it to work together with the latest version of zio-kinesis, so I gave up on it.
+This actually brings me to an important point: there are sometimes very annoying compatibilities between libraries that are built for different minor versions of ZIO (e.g. 2.0.2 vs 2.0.5).
+And if you're not careful about these dependencies you will get some very cryptic error messages. So this is another improvement area. For example:
+`java.lang.Error: Defect in zio.ZEnvironment: Set(SttpBackend[=λ %A → ZIO[-Any,+Throwable,+A],+{package::WebSockets & ZioStreams}]) statically known to be contained within the environment are missing`
+
+Overall though, I believe that the already existing diversity of supporting libraries is a testimony for how strong the foundations are, so kudos to the ZIO devs!
+
+### Final thoughts and looking ahead
+My journey with ZIO so far has been quite exciting. Admittedly, I haven't run my application in anger in production just yet and there is no significant complexity involved in my use case.
+But I believe that I have already touched on most of the usual aspects of the development lifecycle (writing the code, testing, deployment, debugging, profiling, etc) and ZIO had an idiomatic approach to most of these aspects.
+
+I have been quite lucky that I was able to use it in a small greenfield application, and I think that this is the best way to make a start with it. So I'm looking forward to new use cases that can benefit from the elegance and safety of effect systems and ZIO in particular.
+
+One new ZIO feature that I'm interested to look into is [zio-direct](https://github.com/zio/zio-direct), which promises to make the program structure easier to understand, especially for developers that don't have much experience with functional programming and the Scala "for comprehension".
+
+I'm also looking forward to better runtime compatibility between minor releases, because at the moment it can cause some puzzling situations, with seemingly now way out.
+
+I hope that this blog was useful for getting people interested into functional programming, effect systems and oif course, ZIO, and please reach out to me on [Twitter](https://twitter.com/dimitriu_bogdan) if you'd like to know more about my experience with it.
+
+Have fun!
+
+Bogdan
