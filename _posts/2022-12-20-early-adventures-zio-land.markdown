@@ -11,7 +11,7 @@ I really do enjoy coding in Scala whenever I have a chance, although this doesn'
 I also generally enjoy taking a functional approach to writing code, but I've never been a purist, I was looking for elegant but quick solutions.
 I had heard about Cats Effects and ZIO for a couple of years, but I didn't get to look properly into what the buzz was about, until I saw that Daniel Ciocîrlan of [Rock the JVM](https://rockthejvm.com/) released a [course on ZIO](https://rockthejvm.com/p/zio).
 Daniel's Scala courses, videos and articles are just excellent. I thoroughly recommend them to anyone who wants to learn about Scala in a quick and pragmatic way.
-Better yet, this is a course about ZIO 2, which was released in June 2022, rather than about ZIO 1. And ZIO 2 I understand is a fairly big improvement over ZIO 1. Check out John De Goes' post https://degoes.net/articles/zio-2.0 for more details as to why. 
+Better yet, this is a course about ZIO 2, which was released in June 2022, rather than about ZIO 1. And ZIO 2 I understand is a fairly big improvement over ZIO 1. Check out John De Goes' post [https://degoes.net/articles/zio-2.0](https://degoes.net/articles/zio-2.0) for more details as to why. 
 So, I subscribed to his ZIO course. And it was totally worth it! I got to learn about most of the ZIO features in a fun, quick and practical way.
 And it really was a bit of a revelation for me, pretty much in the same way the Spring framework was a revelation when it came to save the Java world from the madness of EJBs :).
 
@@ -24,7 +24,7 @@ These pipes can [fail in expected ways](https://zio.dev/reference/error-manageme
 The pipes (effects) can also optionally have specific features that they require in order to function, so they must be provided by the program. These constitute the effect's environment (the type **R**). You can think of these as smart electronic chips that are required by the individual pipe to actually do what it is supposed to.
 This pipe architecture doesn't do anything until data starts flowing through it. That is until we "run" it with the "effects engine".
 
-In a nutshell this is what a `ZIO[R, E, A]` is about. Of course, I'm over-simplifying things, there is a lot more depth packed into this apparently basic construct.
+In a nutshell this is what a `ZIO[-R, +E, +A]` is about. Of course, I'm over-simplifying things, there is a lot more depth packed into this apparently basic construct.
 
 But this blog is not meant to be a ZIO tutorial, so let's talk about some practical experience with it :)
 
@@ -57,7 +57,7 @@ Based on this, I think that one of the most important early decisions you need t
 Intermezzo: I mention things that "compose well" and "functional composition". What does it mean and why is it a big deal?
 Coming back to the "pipes" analogy - we want to construct a program from smaller pipes, each having a specific role and we want to be able to join them together neatly so that the information can flow through this architecture correctly.
 These pipes are reusable (because the effects just describe code, they don't actually run it) and they can be reused and composed with other pipes in whatever ways we see fit.
-Mathematically functions compose well and this is the model that the effects take as well. And this is because Effect instances (as in `ZIO[R, E, A]`), just like functions, _do not have side effects_.
+Mathematically functions compose well and this is the model that the effects take as well. And this is because Effect instances (as in `ZIO[-R, +E, +A]`), just like functions, _do not have side effects_.
 It's only the code they wrap that may have side effects (like reading from a socket or modifying a file, or even printing something on the console).
 
 ### Dependency injection
@@ -95,7 +95,7 @@ In fact `ZIO.acquireRelease` and the other [resource management]((https://zio.de
 
 Here are some "gotchas" that tripped me for a while until I understood how things should work:
 
-##### Using [ZIO.provideSomeLayer](https://javadoc.io/static/dev.zio/zio_3/2.0.5/zio/ZIO.html#provideSomeLayer-fffff1e1) or [Spec.provideSomeLayer](https://javadoc.io/doc/dev.zio/zio-test_3/latest/zio/test/Spec.html#provideSomeLayer-5d8)
+#### Using [ZIO.provideSomeLayer](https://javadoc.io/static/dev.zio/zio_3/2.0.5/zio/ZIO.html#provideSomeLayer-fffff1e1) or [Spec.provideSomeLayer](https://javadoc.io/doc/dev.zio/zio-test_3/latest/zio/test/Spec.html#provideSomeLayer-5d8)
 Sometimes you don't want to provide all your environment dependency "at the end of the world" (i.e. at the root of your application) and you need to split your environment so that some of it is provided in one place and the rest of it in another place.
 I couldn't find many examples of how this should be used, but as usually you can find the ultimate information in the API docs.
 This was the case when I was writing a test suite where all the tests were supposed to share a set of layers, but also each test had its own layers that needed to be provided. Something like this:
