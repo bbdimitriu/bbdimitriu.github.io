@@ -1,6 +1,6 @@
 ---
 layout: post
-title:  "Early adventures into ZIO land"
+title:  "Early adventures in ZIO land"
 date:   2023-01-14 01:01:53 +0000
 categories: scala zio
 toc: true
